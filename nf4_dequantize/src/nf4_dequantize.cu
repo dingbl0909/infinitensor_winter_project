@@ -68,8 +68,8 @@ __global__ void nf4_dequantize_kernel(
 
     // Unpack two 4-bit NF4 indices from one byte
     uint8_t packed = packed_weights[tid];
-    uint8_t idx_lo = (packed >> 4) & 0x0F;  // upper nibble -> even element
-    uint8_t idx_hi = packed & 0x0F;         // lower nibble -> odd element
+    uint8_t idx_hi = (packed >> 4) & 0x0F;  // upper nibble -> even element
+    uint8_t idx_lo = packed & 0x0F;        // lower nibble -> odd element
 
     // ── Recover block-level scale for element 0 ──
     int blk0  = static_cast<int>(elem0 / blocksize);
@@ -78,17 +78,8 @@ __global__ void nf4_dequantize_kernel(
               * __half2float(absmax2[grp0])
               + offset;
 
-    if (tid == 0) {
-        printf("KERNEL tid=0: packed=%u lo=%u hi=%u blk=%d grp=%d aq=%u\n",
-               packed, idx_lo, idx_hi, blk0, grp0, absmax_q[blk0]);
-        printf("KERNEL tid=0: code2[aq]=%.6f absmax2[grp]=%.6f off=%.6f sc=%.6f\n",
-               __half2float(code2[absmax_q[blk0]]), __half2float(absmax2[grp0]),
-               offset, sc0);
-        printf("KERNEL tid=0: nf4[lo]=%.6f nf4[hi]=%.6f val0=%.6f\n",
-               c_nf4[idx_lo], c_nf4[idx_hi], c_nf4[idx_lo] * sc0);
-    }
 
-    half h0 = __float2half(c_nf4[idx_lo] * sc0);
+    half h0 = __float2half(c_nf4[idx_hi] * sc0);
 
     // ── Element 1 (with boundary guard) ──
     if (elem0 + 1 < total_elements) {
@@ -100,7 +91,7 @@ __global__ void nf4_dequantize_kernel(
                 * __half2float(absmax2[grp1])
                 + offset;
         }
-        half h1 = __float2half(c_nf4[idx_hi] * sc1);
+        half h1 = __float2half(c_nf4[idx_lo] * sc1);
 
         // Vectorized 32-bit store: two fp16 packed into one uint32_t
         uint32_t packed_out = static_cast<uint32_t>(__half_as_ushort(h0))
@@ -157,7 +148,7 @@ int main(int argc, char** argv) {
     int64_t total     = num_rows * num_cols;
     int     num_blocks = static_cast<int>((total + blocksize - 1) / blocksize);
     int64_t n_padded  = static_cast<int64_t>(num_blocks) * blocksize;
-    int64_t num_packed = n_padded / 2;   // bitsandbytes pads to full blocks
+    int64_t num_packed = (total + 1) / 2;   // bitsandbytes pads to full blocks
     int     num_groups = (num_blocks + group_size - 1) / group_size;
 
     printf("Shape: %ldx%ld  blocksize=%d  group_size=%d\n",
@@ -178,16 +169,8 @@ int main(int argc, char** argv) {
     fread(&h_offset,         sizeof(float),    1,          fin);
     fclose(fin);
 
-    printf("Offset: %.6f\n", h_offset);
+    printf("Offset: %.6f\n", h_offset);     
 
-    // Debug: inspect data read from file
-    printf("DEBUG packed[0..3]: %u %u %u %u\n",
-           h_packed[0], h_packed[1], h_packed[2], h_packed[3]);
-    printf("DEBUG absmax_q[0..3]: %u %u %u %u\n",
-           h_absmax_q[0], h_absmax_q[1], h_absmax_q[2], h_absmax_q[3]);
-    printf("DEBUG absmax2[0]: 0x%04x\n", h_absmax2[0]);
-    printf("DEBUG code2[0..3]: 0x%04x 0x%04x 0x%04x 0x%04x\n",
-           h_code2[0], h_code2[1], h_code2[2], h_code2[3]);
 
     // ── 2. Allocate device memory & copy ─────────────────────────────────────
     uint8_t* d_packed    = nullptr;

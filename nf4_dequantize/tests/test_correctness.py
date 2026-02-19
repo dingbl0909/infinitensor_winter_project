@@ -303,18 +303,18 @@ def main():
         # (num_rows, num_cols, blocksize)
         # Standard aligned cases
         (64, 64, 64),
-        # (128, 256, 64),
-        # (512, 1024, 64),
+        (128, 256, 64),
+        (512, 1024, 64),
         
         # # Non-aligned cases (boundary handling)
-        # (100, 100, 64),      # Not aligned to blocksize
-        # (127, 255, 64),      # Odd dimensions
-        # (1, 1000, 64),       # Single row
-        # (1000, 1, 64),       # Single column
-        # (33, 77, 64),        # Arbitrary odd dimensions
+        (100, 100, 64),      # Not aligned to blocksize
+        (127, 255, 64),      # Odd dimensions
+        (1, 1000, 64),       # Single row
+        (1000, 1, 64),       # Single column
+        (33, 77, 64),        # Arbitrary odd dimensions
         
         # # Different blocksizes
-        # (256, 256, 128),
+        (256, 256, 128),
     ]
     
     results = []
