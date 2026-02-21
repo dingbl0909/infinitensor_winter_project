@@ -4,9 +4,38 @@
 #include <cstring>
 #include <vector>
 #include <cmath>
+#include <cfloat>
+#include <climits>
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+
+// ── 主机端 half ↔ float 转换辅助函数 ─────────────────────────────────────
+static inline float half_to_float_host(uint16_t h) {
+    uint32_t sign = (h >> 15) & 0x1;
+    uint32_t exp  = (h >> 10) & 0x1F;
+    uint32_t mant = h & 0x3FF;
+
+    uint32_t f;
+    if (exp == 0) {
+        if (mant == 0) {
+            f = sign << 31;
+        } else {
+            exp = 1;
+            while ((mant & 0x400) == 0) { mant <<= 1; exp--; }
+            mant &= 0x3FF;
+            f = (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13);
+        }
+    } else if (exp == 31) {
+        f = (sign << 31) | 0x7F800000 | (mant << 13);
+    } else {
+        f = (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13);
+    }
+
+    float result;
+    memcpy(&result, &f, sizeof(float));
+    return result;
+}
 
 #define CHECK_CUDA(call)                                                       \
     do {                                                                        \
@@ -38,17 +67,39 @@ __constant__ float c_nf4[16] = {
      1.0f,
 };
 
-// ── BNB 解量化函数声明 ───────────────────────────────────────────────────
+// ── BNB 解量化函数声明（正确签名） ─────────────────────────────────────────
+// 注意：BNB 使用单层量化格式，需要 float* absmax 和总元素数 n
 extern "C" {
 void cdequantize_blockwise_fp16_nf4(
-    float* output,
-    uint8_t* packed_weights,
-    half* absmax2,
-    uint8_t* absmax_q,
-    int blocksize,
-    int group_size,
+    float* code,           // NF4 码本 (通常传 nullptr，BNB 内部有默认表)
+    unsigned char* A,      // packed_weights
+    float* absmax,         // 块级最大值 (float*, 单层量化格式)
+    half* out,             // 输出
+    int blocksize,         // 块大小
+    const int n,           // 总元素数量
     cudaStream_t stream
 );
+}
+
+// ── 将双重量化的 absmax 解码为单层量化格式 ─────────────────────────────────
+// 双重量化: absmax_q[blk] 索引 code2 表，再乘以 absmax2[grp]
+__global__ void decode_double_quant_absmax_kernel(
+    const uint8_t* __restrict__ absmax_q,
+    const half*    __restrict__ absmax2,
+    const half*    __restrict__ code2,
+    float          offset,
+    float*         __restrict__ absmax_out,
+    int            num_blocks,
+    int            group_size)
+{
+    int blk = blockIdx.x * blockDim.x + threadIdx.x;
+    if (blk >= num_blocks) return;
+    
+    int grp = blk / group_size;
+    float scale = __half2float(code2[absmax_q[blk]])
+                * __half2float(absmax2[grp])
+                + offset;
+    absmax_out[blk] = scale;
 }
 
 // ── float → half 转换核（用于 BNB 输出转换） ─────────────────────────────
@@ -59,7 +110,7 @@ __global__ void float2half_kernel(float* in, half* out, int64_t total_elements) 
     }
 }
 
-// ── 你的 NF4 解量化核（完全保留不变） ────────────────────────────────────
+// ── 自己实现的 NF4 解量化核  ────────────────────────────────────
 __global__ void nf4_dequantize_kernel(
     const uint8_t* __restrict__ packed_weights,
     const uint8_t* __restrict__ absmax_q,
@@ -77,12 +128,15 @@ __global__ void nf4_dequantize_kernel(
 
     int64_t elem0 = tid * 2;
 
-    // Unpack two 4-bit NF4 indices (你的逻辑，保留不变)
+    // Unpack two 4-bit NF4 indices
+    // NOTE: BNB packing convention - verify this matches your input data format!
+    // If accuracy comparison fails, try swapping idx_hi and idx_lo assignment.
+    // BNB typical format: lower nibble = first element, upper nibble = second element
     uint8_t packed = packed_weights[tid];
-    uint8_t idx_hi = (packed >> 4) & 0x0F;  // upper nibble -> even element
-    uint8_t idx_lo = packed & 0x0F;        // lower nibble -> odd element
+    uint8_t idx_lo = packed & 0x0F;         // lower nibble -> odd element (elem0 + 1)
+    uint8_t idx_hi = (packed >> 4) & 0x0F;  // upper nibble -> even element (elem0)
 
-    // ── Recover block-level scale for element 0 (保留 offset) ──
+    // ── Recover block-level scale for element 0  ──
     int blk0  = static_cast<int>(elem0 / blocksize);
     int grp0  = blk0 / group_size;
     float sc0 = __half2float(code2[absmax_q[blk0]])
@@ -114,38 +168,40 @@ __global__ void nf4_dequantize_kernel(
 }
 
 // ── 调用 BNB 解量化（用于对比） ─────────────────────────────────────────
+// 注意：需要预先分配缓冲区，避免在计时循环内分配/释放内存
 void run_bnb_dequantize(
     const uint8_t* d_packed,
     const uint8_t* d_absmax_q,
     const half* d_absmax2,
+    const half* d_code2,
+    float offset,
+    float* d_absmax_decoded,  // 预分配的 absmax 解码缓冲区 (num_blocks * sizeof(float))
     half* d_output,
     int64_t total_elems,
+    int num_blocks,
     int blocksize,
     int group_size,
     cudaStream_t stream)
 {
-    // BNB 输出是 float，先分配临时内存
-    float* d_float_buf = nullptr;
-    CHECK_CUDA(cudaMalloc(&d_float_buf, total_elems * sizeof(float)));
-
-    // 调用 BNB 官方解量化函数
-    cdequantize_blockwise_fp16_nf4(
-        d_float_buf,
-        const_cast<uint8_t*>(d_packed),
-        const_cast<half*>(d_absmax2),
-        const_cast<uint8_t*>(d_absmax_q),
-        blocksize,
-        group_size,
-        stream
+    // Step 1: 将双重量化的 absmax 解码为单层量化格式
+    int threads = 256;
+    int blocks_for_absmax = (num_blocks + threads - 1) / threads;
+    decode_double_quant_absmax_kernel<<<blocks_for_absmax, threads, 0, stream>>>(
+        d_absmax_q, d_absmax2, d_code2, offset,
+        d_absmax_decoded, num_blocks, group_size
     );
 
-    // 转换为 FP16
-    int threads = 256;
-    int blocks = static_cast<int>((total_elems + threads - 1) / threads);
-    float2half_kernel<<<blocks, threads, 0, stream>>>(d_float_buf, d_output, total_elems);
-
-    // 释放临时内存
-    CHECK_CUDA(cudaFree(d_float_buf));
+    // Step 2: 调用 BNB 官方解量化函数
+    // 注意：code 参数传 nullptr，BNB 内部使用默认 NF4 码本
+    cdequantize_blockwise_fp16_nf4(
+        nullptr,  // code (使用内部默认 NF4 表)
+        const_cast<uint8_t*>(d_packed),
+        d_absmax_decoded,
+        d_output,
+        blocksize,
+        static_cast<int>(total_elems),
+        stream
+    );
 }
 
 // ── 精度对比函数（集成到 CUDA 代码中） ───────────────────────────────────
@@ -162,28 +218,32 @@ void compare_accuracy(
     CHECK_CUDA(cudaMemcpy(h_bnb_output.data(), d_bnb_output, total_elems * sizeof(half), cudaMemcpyDeviceToHost));
 
     // 计算误差
-    float mae = 0.0f;
+    double mae = 0.0;
     float max_diff = 0.0f;
-    float value_range = 0.0f;
-    float min_ref = 1e9, max_ref = -1e9;
+    float min_ref = FLT_MAX, max_ref = -FLT_MAX;
+    float min_our = FLT_MAX, max_our = -FLT_MAX;
 
     for (int64_t i = 0; i < total_elems; ++i) {
-        float my_val = __half2float(__ushort_as_half(h_my_output[i]));
-        float bnb_val = __half2float(__ushort_as_half(h_bnb_output[i]));
+        float my_val = half_to_float_host(h_my_output[i]);
+        float bnb_val = half_to_float_host(h_bnb_output[i]);
         
-        // 更新范围
-        min_ref = fmin(min_ref, bnb_val);
-        max_ref = fmax(max_ref, bnb_val);
+        // 更新 BNB 参考范围
+        min_ref = fminf(min_ref, bnb_val);
+        max_ref = fmaxf(max_ref, bnb_val);
+        
+        // 更新我们的输出范围
+        min_our = fminf(min_our, my_val);
+        max_our = fmaxf(max_our, my_val);
         
         // 计算误差
-        float diff = fabs(my_val - bnb_val);
+        float diff = fabsf(my_val - bnb_val);
         mae += diff;
-        max_diff = fmax(max_diff, diff);
+        max_diff = fmaxf(max_diff, diff);
     }
 
     mae /= total_elems;
-    value_range = max_ref - min_ref;
-    float relative_mae = (value_range > 1e-8) ? (mae / value_range) : 0.0f;
+    float value_range = max_ref - min_ref;
+    float relative_mae = (value_range > 1e-8f) ? static_cast<float>(mae / value_range) : 0.0f;
 
     // 打印精度结果
     printf("\n=== Accuracy Comparison (My Kernel vs BNB) ===\n");
@@ -191,12 +251,10 @@ void compare_accuracy(
     printf("  MAE (relative):  %.6f\n", relative_mae);
     printf("  Max diff:        %.6f\n", max_diff);
     printf("  Reference range: [%.4f, %.4f]\n", min_ref, max_ref);
-    printf("  Our range:       [%.4f, %.4f]\n", 
-           __half2float(__ushort_as_half(h_my_output[0])),  // 简化展示
-           __half2float(__ushort_as_half(h_my_output[total_elems-1])));
+    printf("  Our range:       [%.4f, %.4f]\n", min_our, max_our);
 
     // 检查是否通过 MAE < 1e-2
-    if (relative_mae < 1e-2) {
+    if (relative_mae < 1e-2f) {
         printf("  ✅ PASSED: relative MAE < 1e-2\n");
     } else {
         printf("  ❌ FAILED: relative MAE >= 1e-2\n");
@@ -239,13 +297,35 @@ int main(int argc, char** argv) {
 
     int64_t num_rows, num_cols;
     int32_t blocksize;
-    fread(&num_rows,  sizeof(int64_t), 1, fin);
-    fread(&num_cols,  sizeof(int64_t), 1, fin);
-    fread(&blocksize, sizeof(int32_t), 1, fin);
+    
+    if (fread(&num_rows,  sizeof(int64_t), 1, fin) != 1 ||
+        fread(&num_cols,  sizeof(int64_t), 1, fin) != 1 ||
+        fread(&blocksize, sizeof(int32_t), 1, fin) != 1) {
+        fprintf(stderr, "Error: Failed to read header from input file\n");
+        fclose(fin);
+        return EXIT_FAILURE;
+    }
+
+    // 输入参数验证
+    if (num_rows <= 0 || num_cols <= 0) {
+        fprintf(stderr, "Error: Invalid dimensions (rows=%ld, cols=%ld)\n",
+                (long)num_rows, (long)num_cols);
+        fclose(fin);
+        return EXIT_FAILURE;
+    }
+    if (blocksize <= 0) {
+        fprintf(stderr, "Error: Invalid blocksize (%d)\n", blocksize);
+        fclose(fin);
+        return EXIT_FAILURE;
+    }
+    if (group_size <= 0) {
+        fprintf(stderr, "Error: Invalid group_size (%d)\n", group_size);
+        fclose(fin);
+        return EXIT_FAILURE;
+    }
 
     int64_t total     = num_rows * num_cols;
     int     num_blocks = static_cast<int>((total + blocksize - 1) / blocksize);
-    int64_t n_padded  = static_cast<int64_t>(num_blocks) * blocksize;
     int64_t num_packed = (total + 1) / 2;
     int     num_groups = (num_blocks + group_size - 1) / group_size;
 
@@ -261,22 +341,35 @@ int main(int argc, char** argv) {
     std::vector<uint16_t> h_code2(256);
     float h_offset = 0.0f;
 
-    fread(h_packed.data(),   1,              num_packed,  fin);
-    fread(h_absmax_q.data(), 1,              num_blocks,  fin);
-    fread(h_absmax2.data(),  sizeof(uint16_t), num_groups, fin);
-    fread(h_code2.data(),    sizeof(uint16_t), 256,        fin);
-    fread(&h_offset,         sizeof(float),    1,          fin);
+    size_t r1 = fread(h_packed.data(),   1,               num_packed,  fin);
+    size_t r2 = fread(h_absmax_q.data(), 1,               num_blocks,  fin);
+    size_t r3 = fread(h_absmax2.data(),  sizeof(uint16_t), num_groups, fin);
+    size_t r4 = fread(h_code2.data(),    sizeof(uint16_t), 256,        fin);
+    size_t r5 = fread(&h_offset,         sizeof(float),    1,          fin);
     fclose(fin);
+
+    if (r1 != static_cast<size_t>(num_packed) || 
+        r2 != static_cast<size_t>(num_blocks) ||
+        r3 != static_cast<size_t>(num_groups) || 
+        r4 != 256 || r5 != 1) {
+        fprintf(stderr, "Error: Input file is truncated or corrupted\n");
+        fprintf(stderr, "  Expected: packed=%ld, absmax_q=%d, absmax2=%d, code2=256, offset=1\n",
+                (long)num_packed, num_blocks, num_groups);
+        fprintf(stderr, "  Got:      packed=%zu, absmax_q=%zu, absmax2=%zu, code2=%zu, offset=%zu\n",
+                r1, r2, r3, r4, r5);
+        return EXIT_FAILURE;
+    }
 
     printf("Offset: %.6f\n", h_offset);     
 
     // ── 2. Allocate device memory & copy ─────────────────────────────────────
-    uint8_t* d_packed    = nullptr;
-    uint8_t* d_absmax_q  = nullptr;
-    half*    d_absmax2   = nullptr;
-    half*    d_code2     = nullptr;
-    half*    d_my_output = nullptr;
-    half*    d_bnb_output = nullptr;  // 新增：BNB 输出内存
+    uint8_t* d_packed     = nullptr;
+    uint8_t* d_absmax_q   = nullptr;
+    half*    d_absmax2    = nullptr;
+    half*    d_code2      = nullptr;
+    half*    d_my_output  = nullptr;
+    half*    d_bnb_output = nullptr;
+    float*   d_absmax_decoded = nullptr;  // BNB 需要的单层量化 absmax (num_blocks * float)
 
     CHECK_CUDA(cudaMalloc(&d_packed,   num_packed));
     CHECK_CUDA(cudaMalloc(&d_absmax_q, num_blocks));
@@ -284,6 +377,7 @@ int main(int argc, char** argv) {
     CHECK_CUDA(cudaMalloc(&d_code2,    256 * sizeof(half)));
     CHECK_CUDA(cudaMalloc(&d_my_output,   total * sizeof(half)));
     CHECK_CUDA(cudaMalloc(&d_bnb_output,  total * sizeof(half)));
+    CHECK_CUDA(cudaMalloc(&d_absmax_decoded, num_blocks * sizeof(float)));
 
     CHECK_CUDA(cudaMemcpy(d_packed,   h_packed.data(),   num_packed,
                            cudaMemcpyHostToDevice));
@@ -297,8 +391,14 @@ int main(int argc, char** argv) {
     // ── 3. Launch configuration ──────────────────────────────────────────────
     const int threads_per_block = 256;
     int64_t num_pairs = (total + 1) / 2;
-    int grid_size = static_cast<int>((num_pairs + threads_per_block - 1)
-                                     / threads_per_block);
+    int64_t grid_size_64 = (num_pairs + threads_per_block - 1) / threads_per_block;
+    
+    if (grid_size_64 > INT_MAX) {
+        fprintf(stderr, "Error: Grid size overflow (%lld > INT_MAX). Data too large.\n",
+                (long long)grid_size_64);
+        return EXIT_FAILURE;
+    }
+    int grid_size = static_cast<int>(grid_size_64);
 
     // 创建流
     cudaStream_t stream;
@@ -313,8 +413,9 @@ int main(int argc, char** argv) {
             d_my_output, total, blocksize, group_size);
         // BNB kernel
         run_bnb_dequantize(
-            d_packed, d_absmax_q, d_absmax2, d_bnb_output,
-            total, blocksize, group_size, stream);
+            d_packed, d_absmax_q, d_absmax2, d_code2, h_offset,
+            d_absmax_decoded, d_bnb_output,
+            total, num_blocks, blocksize, group_size, stream);
     }
     CHECK_CUDA(cudaStreamSynchronize(stream));
     CHECK_CUDA(cudaGetLastError());
@@ -342,8 +443,9 @@ int main(int argc, char** argv) {
     CHECK_CUDA(cudaEventRecord(ev_start, stream));
     for (int i = 0; i < iters; ++i) {
         run_bnb_dequantize(
-            d_packed, d_absmax_q, d_absmax2, d_bnb_output,
-            total, blocksize, group_size, stream);
+            d_packed, d_absmax_q, d_absmax2, d_code2, h_offset,
+            d_absmax_decoded, d_bnb_output,
+            total, num_blocks, blocksize, group_size, stream);
     }
     CHECK_CUDA(cudaEventRecord(ev_stop, stream));
     CHECK_CUDA(cudaEventSynchronize(ev_stop));
@@ -377,15 +479,21 @@ int main(int argc, char** argv) {
                            cudaMemcpyDeviceToHost));
 
     int nonzero = 0;
-    for (int i = 0; i < 100 && i < total; ++i)
+    for (int64_t i = 0; i < 100 && i < total; ++i)
         if (h_output[i] != 0) nonzero++;
     printf("\nDEBUG: first 100 outputs, %d non-zero. raw[0..3]: 0x%04x 0x%04x 0x%04x 0x%04x\n",
            nonzero, h_output[0], h_output[1], h_output[2], h_output[3]);
 
     FILE* fout = fopen(output_path, "wb");
     if (!fout) { perror("fopen(output)"); return EXIT_FAILURE; }
-    fwrite(h_output.data(), sizeof(uint16_t), total, fout);
+    size_t written = fwrite(h_output.data(), sizeof(uint16_t), total, fout);
     fclose(fout);
+
+    if (written != static_cast<size_t>(total)) {
+        fprintf(stderr, "Error: Failed to write all output data (wrote %zu of %ld)\n",
+                written, (long)total);
+        return EXIT_FAILURE;
+    }
 
     printf("\nOutput: %ld fp16 values -> %s\n", (long)total, output_path);
 
@@ -399,6 +507,7 @@ int main(int argc, char** argv) {
     CHECK_CUDA(cudaFree(d_code2));
     CHECK_CUDA(cudaFree(d_my_output));
     CHECK_CUDA(cudaFree(d_bnb_output));
+    CHECK_CUDA(cudaFree(d_absmax_decoded));
 
     return 0;
 }
