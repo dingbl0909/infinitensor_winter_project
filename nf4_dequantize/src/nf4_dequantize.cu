@@ -129,12 +129,12 @@ __global__ void nf4_dequantize_kernel(
     int64_t elem0 = tid * 2;
 
     // Unpack two 4-bit NF4 indices
-    // NOTE: BNB packing convention - verify this matches your input data format!
-    // If accuracy comparison fails, try swapping idx_hi and idx_lo assignment.
-    // BNB typical format: lower nibble = first element, upper nibble = second element
+    // BNB packing convention (verified from BNB source code):
+    //   upper nibble (bits 4-7) -> even element (elem0)
+    //   lower nibble (bits 0-3) -> odd element (elem0 + 1)
     uint8_t packed = packed_weights[tid];
-    uint8_t idx_lo = packed & 0x0F;         // lower nibble -> odd element (elem0 + 1)
-    uint8_t idx_hi = (packed >> 4) & 0x0F;  // upper nibble -> even element (elem0)
+    uint8_t idx_even = (packed >> 4) & 0x0F;  // upper nibble -> even element (elem0)
+    uint8_t idx_odd  = packed & 0x0F;         // lower nibble -> odd element (elem0 + 1)
 
     // ── Recover block-level scale for element 0  ──
     int blk0  = static_cast<int>(elem0 / blocksize);
@@ -143,7 +143,7 @@ __global__ void nf4_dequantize_kernel(
               * __half2float(absmax2[grp0])
               + offset;
 
-    half h0 = __float2half(c_nf4[idx_hi] * sc0);
+    half h0 = __float2half(c_nf4[idx_even] * sc0);
 
     // ── Element 1 (with boundary guard) ──
     if (elem0 + 1 < total_elements) {
@@ -155,7 +155,7 @@ __global__ void nf4_dequantize_kernel(
                 * __half2float(absmax2[grp1])
                 + offset;
         }
-        half h1 = __float2half(c_nf4[idx_lo] * sc1);
+        half h1 = __float2half(c_nf4[idx_odd] * sc1);
 
         // Vectorized 32-bit store: two fp16 packed into one uint32_t
         uint32_t packed_out = static_cast<uint32_t>(__half_as_ushort(h0))
@@ -439,13 +439,30 @@ int main(int argc, char** argv) {
     CHECK_CUDA(cudaEventElapsedTime(&my_elapsed_ms, ev_start, ev_stop));
     float my_avg_ms = my_elapsed_ms / iters;
 
-    // 5.2 计时：BNB kernel
+    // 5.2 计时：BNB kernel (只测量纯反量化时间，不包含双重量化absmax解码)
+    // 预先解码 absmax（在计时循环外完成）
+    {
+        int threads = 256;
+        int blocks_for_absmax = (num_blocks + threads - 1) / threads;
+        decode_double_quant_absmax_kernel<<<blocks_for_absmax, threads, 0, stream>>>(
+            d_absmax_q, d_absmax2, d_code2, h_offset,
+            d_absmax_decoded, num_blocks, group_size
+        );
+        CHECK_CUDA(cudaStreamSynchronize(stream));
+    }
+
+    // 只计时 BNB 的纯反量化 kernel
     CHECK_CUDA(cudaEventRecord(ev_start, stream));
     for (int i = 0; i < iters; ++i) {
-        run_bnb_dequantize(
-            d_packed, d_absmax_q, d_absmax2, d_code2, h_offset,
-            d_absmax_decoded, d_bnb_output,
-            total, num_blocks, blocksize, group_size, stream);
+        cdequantize_blockwise_fp16_nf4(
+            nullptr,  // code (使用内部默认 NF4 表)
+            const_cast<uint8_t*>(d_packed),
+            d_absmax_decoded,
+            d_bnb_output,
+            blocksize,
+            static_cast<int>(total),
+            stream
+        );
     }
     CHECK_CUDA(cudaEventRecord(ev_stop, stream));
     CHECK_CUDA(cudaEventSynchronize(ev_stop));
