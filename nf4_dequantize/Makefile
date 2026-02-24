@@ -1,7 +1,7 @@
 NVCC ?= /usr/local/cuda/bin/nvcc
 
 # Set SM to your GPU arch (T4: 75). Override like: make SM=80
-SM ?= 89
+SM ?= 86
 
 TARGET := nf4_dequantize
 SRC := src/nf4_dequantize.cu
@@ -15,21 +15,17 @@ NVCCFLAGS += -gencode arch=compute_$(SM),code=sm_$(SM)
 NVCCFLAGS += -Xcompiler -fPIC
 
 # ===================== 精准适配 bitsandbytes 库路径 =====================
-# 自定义 Python 环境路径
-PY_ENV_PATH := /home/blding/pytorch_env
-PYTHON := $(PY_ENV_PATH)/bin/python3
+PYTHON := /usr/bin/python3
 
-# 自动查找 bitsandbytes 安装路径
+# bitsandbytes 安装路径
 BNB_PATH := $(shell $(PYTHON) -c "import bitsandbytes; print(bitsandbytes.__path__[0])" 2>/dev/null)
-
-# 检查 bitsandbytes 是否安装
 ifeq ($(BNB_PATH),)
-$(error "bitsandbytes not found in $(PY_ENV_PATH)! Please install it first: $(PYTHON) -m pip install bitsandbytes")
+BNB_PATH := /usr/local/lib/python3.12/dist-packages/bitsandbytes
 endif
 
 # 指定 CUDA 版本的 bitsandbytes 库（根据你的系统 CUDA 版本选）
 # 先执行：nvcc --version 查看系统 CUDA 版本，再修改
-BNB_CUDA_VERSION := 126
+BNB_CUDA_VERSION := 128
 BNB_LIB_NAME := libbitsandbytes_cuda$(BNB_CUDA_VERSION).so
 BNB_LIB_PATH := $(BNB_PATH)/$(BNB_LIB_NAME)
 
@@ -49,7 +45,9 @@ LDFLAGS += -Xlinker -rpath=$(BNB_PATH)
 # 补充依赖库
 LDFLAGS += -lcudart -lpthread -ldl
 
-.PHONY: all clean run help
+PROFILE_BIN := $(BUILD_DIR)/$(TARGET)_profile
+
+.PHONY: all clean run help profile
 
 all: $(BIN)
 
@@ -60,18 +58,34 @@ $(BUILD_DIR):
 $(BIN): $(SRC) | $(BUILD_DIR)
 	$(NVCC) $(NVCCFLAGS) -o $@ $< $(LDFLAGS)
 
+# Profile build: 带 -lineinfo 用于 ncu 源代码级分析
+$(PROFILE_BIN): $(SRC) | $(BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) -lineinfo -o $@ $< $(LDFLAGS)
+
 clean:
 	rm -rf $(BUILD_DIR)
 
 run: $(BIN)
 	@echo "Running NF4 dequantize benchmark (CUDA $(BNB_CUDA_VERSION))..."
-	./$(BIN) --input test_quant.bin --output test_dequant.bin --group_size 256 --warmup 5 --iters 20
+	./$(BIN) --input data/input.bin --output data/output.bin --group_size 256 --warmup 5 --iters 20
+
+profile: $(PROFILE_BIN)
+	@echo "=== Running ncu profile on nf4_dequantize_kernel ==="
+	ncu --set full \
+	    --kernel-name nf4_dequantize_kernel \
+	    --launch-skip 0 --launch-count 1 \
+	    -o $(BUILD_DIR)/nf4_profile \
+	    ./$(PROFILE_BIN) --input data/input.bin --output data/output.bin --group_size 256 --warmup 0 --iters 1
+	@echo "Profile saved to $(BUILD_DIR)/nf4_profile.ncu-rep"
+	@echo "Open with: ncu-ui $(BUILD_DIR)/nf4_profile.ncu-rep"
 
 help:
 	@echo "Targets:"
 	@echo "  make [SM=75]            Build $(BIN) (link with bitsandbytes CUDA $(BNB_CUDA_VERSION))"
 	@echo "  make clean              Remove build/"
 	@echo "  make run                Build and run with test parameters"
+	@echo ""
+	@echo "  make profile             Build with -lineinfo and run ncu profiling"
 	@echo ""
 	@echo "修改 CUDA 版本：编辑 Makefile 中的 BNB_CUDA_VERSION 变量（当前：$(BNB_CUDA_VERSION)）"
 	@echo "Examples:"

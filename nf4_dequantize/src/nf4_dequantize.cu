@@ -110,7 +110,10 @@ __global__ void float2half_kernel(float* in, half* out, int64_t total_elements) 
     }
 }
 
-// ── 自己实现的 NF4 解量化核  ────────────────────────────────────
+// ── 自己实现的 NF4 解量化核（优化版） ────────────────────────────────────
+// 优化点：
+//   1) shared memory 预加载 scale，消除 global load broadcast 浪费
+//   2) NF4 表从 constant → shared memory，避免 constant cache 序列化
 __global__ void nf4_dequantize_kernel(
     const uint8_t* __restrict__ packed_weights,
     const uint8_t* __restrict__ absmax_q,
@@ -122,47 +125,55 @@ __global__ void nf4_dequantize_kernel(
     int            blocksize,
     int            group_size)
 {
+    extern __shared__ float smem[];
+    float* s_nf4    = smem;            // [16]
+    float* s_scales = smem + 16;       // [num_blks_in_tb]
+
+    if (threadIdx.x < 16) s_nf4[threadIdx.x] = c_nf4[threadIdx.x];
+
+    // ── Cooperatively preload scales for this threadblock ──
+    int base_elem = static_cast<int>(static_cast<int64_t>(blockIdx.x) * blockDim.x * 2);
+    int base_blk  = base_elem / blocksize;
+    int end_elem  = base_elem + static_cast<int>(blockDim.x) * 2;
+    if (end_elem > static_cast<int>(total_elements))
+        end_elem = static_cast<int>(total_elements);
+    int end_blk  = (end_elem - 1) / blocksize;
+    int num_blks = end_blk - base_blk + 1;
+
+    if (static_cast<int>(threadIdx.x) < num_blks) {
+        int blk = base_blk + threadIdx.x;
+        int grp = blk / group_size;
+        s_scales[threadIdx.x] = __half2float(code2[absmax_q[blk]])
+                               * __half2float(absmax2[grp])
+                               + offset;
+    }
+    __syncthreads();
+
+    // ── Main computation ──
     int64_t tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     int64_t num_pairs = (total_elements + 1) / 2;
     if (tid >= num_pairs) return;
 
     int64_t elem0 = tid * 2;
 
-    // Unpack two 4-bit NF4 indices
-    // BNB packing convention (verified from BNB source code):
-    //   upper nibble (bits 4-7) -> even element (elem0)
-    //   lower nibble (bits 0-3) -> odd element (elem0 + 1)
     uint8_t packed = packed_weights[tid];
-    uint8_t idx_even = (packed >> 4) & 0x0F;  // upper nibble -> even element (elem0)
-    uint8_t idx_odd  = packed & 0x0F;         // lower nibble -> odd element (elem0 + 1)
+    uint8_t idx_even = (packed >> 4) & 0x0F;
+    uint8_t idx_odd  = packed & 0x0F;
 
-    // ── Recover block-level scale for element 0  ──
     int blk0  = static_cast<int>(elem0 / blocksize);
-    int grp0  = blk0 / group_size;
-    float sc0 = __half2float(code2[absmax_q[blk0]])
-              * __half2float(absmax2[grp0])
-              + offset;
+    float sc0 = s_scales[blk0 - base_blk];
 
-    half h0 = __float2half(c_nf4[idx_even] * sc0);
+    half h0 = __float2half(s_nf4[idx_even] * sc0);
 
-    // ── Element 1 (with boundary guard) ──
     if (elem0 + 1 < total_elements) {
         int blk1 = static_cast<int>((elem0 + 1) / blocksize);
-        float sc1 = sc0;
-        if (blk1 != blk0) {
-            int grp1 = blk1 / group_size;
-            sc1 = __half2float(code2[absmax_q[blk1]])
-                * __half2float(absmax2[grp1])
-                + offset;
-        }
-        half h1 = __float2half(c_nf4[idx_odd] * sc1);
+        float sc1 = (blk1 != blk0) ? s_scales[blk1 - base_blk] : sc0;
+        half h1 = __float2half(s_nf4[idx_odd] * sc1);
 
-        // Vectorized 32-bit store: two fp16 packed into one uint32_t
         uint32_t packed_out = static_cast<uint32_t>(__half_as_ushort(h0))
                             | (static_cast<uint32_t>(__half_as_ushort(h1)) << 16);
         reinterpret_cast<uint32_t*>(output)[tid] = packed_out;
     } else {
-        // Last element when total is odd — scalar store
         output[elem0] = h0;
     }
 }
@@ -400,6 +411,10 @@ int main(int argc, char** argv) {
     }
     int grid_size = static_cast<int>(grid_size_64);
 
+    // shared memory: 16 floats (NF4 table) + max blocks per threadblock
+    int max_blks_per_tb = (threads_per_block * 2 + blocksize - 1) / blocksize + 1;
+    size_t smem_bytes = (16 + max_blks_per_tb) * sizeof(float);
+
     // 创建流
     cudaStream_t stream;
     CHECK_CUDA(cudaStreamCreate(&stream));
@@ -407,8 +422,7 @@ int main(int argc, char** argv) {
     // ── 4. Warmup ────────────────────────────────────────────────────────────
     printf("\n=== Warming up (%d iterations) ===\n", warmup);
     for (int i = 0; i < warmup; ++i) {
-        // 你的 kernel
-        nf4_dequantize_kernel<<<grid_size, threads_per_block, 0, stream>>>(
+        nf4_dequantize_kernel<<<grid_size, threads_per_block, smem_bytes, stream>>>(
             d_packed, d_absmax_q, d_absmax2, d_code2, h_offset,
             d_my_output, total, blocksize, group_size);
         // BNB kernel
@@ -428,7 +442,7 @@ int main(int argc, char** argv) {
     // 5.1 计时：你的 kernel
     CHECK_CUDA(cudaEventRecord(ev_start, stream));
     for (int i = 0; i < iters; ++i) {
-        nf4_dequantize_kernel<<<grid_size, threads_per_block, 0, stream>>>(
+        nf4_dequantize_kernel<<<grid_size, threads_per_block, smem_bytes, stream>>>(
             d_packed, d_absmax_q, d_absmax2, d_code2, h_offset,
             d_my_output, total, blocksize, group_size);
     }
@@ -485,7 +499,7 @@ int main(int argc, char** argv) {
            my_avg_ms, iters, my_bw_gbs);
     printf("BNB Kernel : %.4f ms (avg of %d iters) | Bandwidth: %.2f GB/s\n", 
            bnb_avg_ms, iters, bnb_bw_gbs);
-    printf("Speedup    : %.2fx (My Kernel is faster than BNB)\n", speedup);
+    printf("Speedup    : %.2fx \n", speedup);
 
     // ── 6. Accuracy Check (集成到 CUDA 代码中) ──────────────────────────────
     compare_accuracy(d_my_output, d_bnb_output, total);
