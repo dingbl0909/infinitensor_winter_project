@@ -8,9 +8,11 @@ Requirements (README.md 功能正确性 第三点):
 """
 
 import os
+import re
 import struct
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 import numpy as np
@@ -167,7 +169,54 @@ def run_dequantize(
         raise RuntimeError(
             f"nf4_dequantize failed:\nstdout: {result.stdout}\nstderr: {result.stderr}"
         )
-    print(result.stdout)
+    return result.stdout
+
+
+def parse_cuda_benchmark(stdout: str):
+    """
+    Parse kernel timing from CUDA executable output.
+    Expected lines:
+      My Kernel  : X.XXXX ms ...
+      BNB Kernel : X.XXXX ms ...
+      Speedup    : X.XXx
+    """
+    my_match = re.search(r"My Kernel\s*:\s*([0-9.]+)\s*ms", stdout)
+    bnb_match = re.search(r"BNB Kernel\s*:\s*([0-9.]+)\s*ms", stdout)
+    speedup_match = re.search(r"Speedup\s*:\s*([0-9.]+)x", stdout)
+
+    if not my_match:
+        raise ValueError("Failed to parse 'My Kernel' timing from CUDA output")
+
+    metrics = {
+        "my_kernel_ms": float(my_match.group(1)),
+        "bnb_kernel_ms_in_cuda": float(bnb_match.group(1)) if bnb_match else None,
+        "speedup_in_cuda": float(speedup_match.group(1)) if speedup_match else None,
+    }
+    return metrics
+
+
+def benchmark_bnb_python(
+    packed: torch.Tensor,
+    state,
+    warmup: int = 20,
+    iters: int = 200,
+):
+    """Benchmark bitsandbytes dequantize_4bit in Python (CUDA events)."""
+    # Warmup
+    for _ in range(warmup):
+        _ = F.dequantize_4bit(packed, state)
+    torch.cuda.synchronize()
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iters):
+        _ = F.dequantize_4bit(packed, state)
+    end.record()
+    torch.cuda.synchronize()
+
+    elapsed_ms = start.elapsed_time(end)
+    return elapsed_ms / iters
 
 
 def compute_mae(a: np.ndarray, b: np.ndarray) -> float:
@@ -193,6 +242,9 @@ def test_correctness(
     num_cols: int,
     blocksize: int = 64,
     compute_type: str = "fp16",
+    benchmark: bool = True,
+    benchmark_warmup: int = 20,
+    benchmark_iters: int = 200,
     seed: int = 42,
 ):
     """
@@ -252,13 +304,14 @@ def test_correctness(
         
         # Run CUDA dequantize
         print("Running CUDA nf4_dequantize...")
-        run_dequantize(
+        cuda_stdout = run_dequantize(
             exe_path,
             input_bin,
             output_bin,
             compute_type=compute_type,
             group_size=components["group_size"],
         )
+        print(cuda_stdout)
         
         # Read output
         num_elems = num_rows * num_cols
@@ -284,11 +337,46 @@ def test_correctness(
         print(f"\n✓ PASSED: relative MAE ({relative_mae:.6f}) < {threshold}")
     else:
         print(f"\n✗ FAILED: relative MAE ({relative_mae:.6f}) >= {threshold}")
-    
+
+    benchmark_metrics = {}
+    if benchmark:
+        print(f"\n{'-'*60}")
+        print("Performance benchmark (Python orchestration)")
+        print(f"{'-'*60}")
+        # 1) Parse our kernel timing from CUDA executable output
+        cuda_bench = parse_cuda_benchmark(cuda_stdout)
+        my_ms = cuda_bench["my_kernel_ms"]
+
+        # 2) Time bitsandbytes dequantize in Python with same quantized data
+        bnb_py_ms = benchmark_bnb_python(
+            packed=packed,
+            state=state,
+            warmup=benchmark_warmup,
+            iters=benchmark_iters,
+        )
+        py_speedup = bnb_py_ms / my_ms
+
+        benchmark_metrics = {
+            "my_kernel_ms": my_ms,
+            "bnb_python_ms": bnb_py_ms,
+            "speedup_vs_bnb_python": py_speedup,
+            "bnb_kernel_ms_in_cuda": cuda_bench["bnb_kernel_ms_in_cuda"],
+            "speedup_in_cuda": cuda_bench["speedup_in_cuda"],
+        }
+
+        print(f"My kernel (CUDA exe):     {my_ms:.4f} ms")
+        print(f"BNB kernel (Python API):  {bnb_py_ms:.4f} ms")
+        print(f"Speedup (BNB_py / My):    {py_speedup:.2f}x")
+        if cuda_bench["bnb_kernel_ms_in_cuda"] is not None:
+            print(f"BNB kernel (inside exe):  {cuda_bench['bnb_kernel_ms_in_cuda']:.4f} ms")
+        if cuda_bench["speedup_in_cuda"] is not None:
+            print(f"Speedup (inside exe):     {cuda_bench['speedup_in_cuda']:.2f}x")
+
     return passed, {
         "mae": mae,
         "relative_mae": relative_mae,
         "max_diff": max_diff,
+        **benchmark_metrics,
     }
 
 
@@ -325,6 +413,9 @@ def main():
                 num_cols=num_cols,
                 blocksize=blocksize,
                 compute_type="fp16",
+                benchmark=True,
+                benchmark_warmup=20,
+                benchmark_iters=200,
             )
             results.append((num_rows, num_cols, blocksize, passed, metrics))
         except Exception as e:
@@ -344,7 +435,17 @@ def main():
         if "error" in metrics:
             print(f"  [{status}] {num_rows:4d}x{num_cols:4d} bs={blocksize:3d}: ERROR - {metrics['error']}")
         else:
-            print(f"  [{status}] {num_rows:4d}x{num_cols:4d} bs={blocksize:3d}: MAE(rel)={metrics['relative_mae']:.6f}")
+            perf = ""
+            if "speedup_vs_bnb_python" in metrics:
+                perf = (
+                    f", My={metrics['my_kernel_ms']:.4f}ms, "
+                    f"BNB_py={metrics['bnb_python_ms']:.4f}ms, "
+                    f"Speedup={metrics['speedup_vs_bnb_python']:.2f}x"
+                )
+            print(
+                f"  [{status}] {num_rows:4d}x{num_cols:4d} bs={blocksize:3d}: "
+                f"MAE(rel)={metrics['relative_mae']:.6f}{perf}"
+            )
     
     print(f"\nTotal: {passed}/{total} tests passed")
     
