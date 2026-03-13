@@ -151,7 +151,6 @@ def run_dequantize(
     exe_path: Path,
     input_bin: str,
     output_bin: str,
-    compute_type: str = "fp16",
     group_size: int = 256,
 ) -> None:
     """Run the CUDA dequantize executable."""
@@ -159,7 +158,6 @@ def run_dequantize(
         str(exe_path),
         "--input", input_bin,
         "--output", output_bin,
-        "--compute_type", compute_type,
         "--group_size", str(group_size),
         "--warmup", "1",
         "--iters", "1",
@@ -175,24 +173,13 @@ def run_dequantize(
 def parse_cuda_benchmark(stdout: str):
     """
     Parse kernel timing from CUDA executable output.
-    Expected lines:
+    Expected line:
       My Kernel  : X.XXXX ms ...
-      BNB Kernel : X.XXXX ms ...
-      Speedup    : X.XXx
     """
     my_match = re.search(r"My Kernel\s*:\s*([0-9.]+)\s*ms", stdout)
-    bnb_match = re.search(r"BNB Kernel\s*:\s*([0-9.]+)\s*ms", stdout)
-    speedup_match = re.search(r"Speedup\s*:\s*([0-9.]+)x", stdout)
-
     if not my_match:
         raise ValueError("Failed to parse 'My Kernel' timing from CUDA output")
-
-    metrics = {
-        "my_kernel_ms": float(my_match.group(1)),
-        "bnb_kernel_ms_in_cuda": float(bnb_match.group(1)) if bnb_match else None,
-        "speedup_in_cuda": float(speedup_match.group(1)) if speedup_match else None,
-    }
-    return metrics
+    return {"my_kernel_ms": float(my_match.group(1))}
 
 
 def benchmark_bnb_python(
@@ -241,7 +228,6 @@ def test_correctness(
     num_rows: int,
     num_cols: int,
     blocksize: int = 64,
-    compute_type: str = "fp16",
     benchmark: bool = True,
     benchmark_warmup: int = 20,
     benchmark_iters: int = 200,
@@ -251,7 +237,7 @@ def test_correctness(
     Test that our CUDA implementation matches bitsandbytes within MAE < 1e-2.
     """
     print(f"\n{'='*60}")
-    print(f"Testing: {num_rows}x{num_cols}, blocksize={blocksize}, dtype={compute_type}")
+    print(f"Testing: {num_rows}x{num_cols}, blocksize={blocksize}")
     print(f"{'='*60}")
     
     torch.manual_seed(seed)
@@ -308,7 +294,6 @@ def test_correctness(
             exe_path,
             input_bin,
             output_bin,
-            compute_type=compute_type,
             group_size=components["group_size"],
         )
         print(cuda_stdout)
@@ -360,17 +345,11 @@ def test_correctness(
             "my_kernel_ms": my_ms,
             "bnb_python_ms": bnb_py_ms,
             "speedup_vs_bnb_python": py_speedup,
-            "bnb_kernel_ms_in_cuda": cuda_bench["bnb_kernel_ms_in_cuda"],
-            "speedup_in_cuda": cuda_bench["speedup_in_cuda"],
         }
 
         print(f"My kernel (CUDA exe):     {my_ms:.4f} ms")
         print(f"BNB kernel (Python API):  {bnb_py_ms:.4f} ms")
         print(f"Speedup (BNB_py / My):    {py_speedup:.2f}x")
-        if cuda_bench["bnb_kernel_ms_in_cuda"] is not None:
-            print(f"BNB kernel (inside exe):  {cuda_bench['bnb_kernel_ms_in_cuda']:.4f} ms")
-        if cuda_bench["speedup_in_cuda"] is not None:
-            print(f"Speedup (inside exe):     {cuda_bench['speedup_in_cuda']:.2f}x")
 
     return passed, {
         "mae": mae,
@@ -412,7 +391,6 @@ def main():
                 num_rows=num_rows,
                 num_cols=num_cols,
                 blocksize=blocksize,
-                compute_type="fp16",
                 benchmark=True,
                 benchmark_warmup=20,
                 benchmark_iters=200,
