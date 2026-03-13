@@ -1,0 +1,3 @@
+blocksize = 64                 # 块大小，必须与数据文件一致
+compute_type = "fp16"          # 输出数据类型：bf16 或 fp16
+target_gpu = "A10"              # 目标 GPU 型号（影响优化策略）
